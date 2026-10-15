@@ -315,6 +315,7 @@ pub const FW_NORMAL: i32 = 400;
 pub const DEFAULT_CHARSET: u8 = 1;
 pub const OUT_DEFAULT_PRECIS: u8 = 0;
 pub const CLIP_DEFAULT_PRECIS: u8 = 0;
+pub const ANTIALIASED_QUALITY: u8 = 4;
 pub const CLEARTYPE_QUALITY: u8 = 5;
 pub const DEFAULT_PITCH: u8 = 0;
 pub const FIXED_PITCH: u8 = 1;

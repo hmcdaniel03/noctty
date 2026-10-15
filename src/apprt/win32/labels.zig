@@ -1170,8 +1170,28 @@ pub fn visibleTabRange(tab_count: usize, active_index: usize, tab_area_width: i3
     return .{ .start = start, .count = max_visible };
 }
 
-const tab_button_label_fmt = "{s}{d}: {s}";
-const tab_button_label_pane_fmt = "{s}{d}: {s} ({d})";
+/// How a tab button's label is decorated. `decorated` puts the active marker
+/// and the 1-based index in front of the title (`* 2: pwsh`); `plain` shows
+/// the title alone (`pwsh`), as Ghostty's own tab bar does. `plain` is for
+/// `window-theme = ghostty`, where the active tab is told apart by its fill.
+/// Both keep the ` (N)` pane count.
+pub const TabLabelStyle = enum { decorated, plain };
+
+fn writeTabButtonLabel(
+    w: *std.Io.Writer,
+    style: TabLabelStyle,
+    index: usize,
+    active: bool,
+    title: []const u8,
+    pane_count: usize,
+    show_pane_count: bool,
+) std.Io.Writer.Error!void {
+    if (style == .decorated) {
+        try w.print("{s}{d}: ", .{ tabButtonActiveMarker(active), index + 1 });
+    }
+    try w.writeAll(title);
+    if (show_pane_count and pane_count > 1) try w.print(" ({d})", .{pane_count});
+}
 
 /// Smallest title budget `tabButtonTitleBudget` will hand back. A button too
 /// narrow to hold even its own decorations still shows an ellipsis rather than
@@ -1197,26 +1217,29 @@ pub fn tabButtonTitleBudget(
     max_width: usize,
     show_pane_count: bool,
 ) usize {
+    return tabButtonTitleBudgetStyled(.decorated, index, active, pane_count, max_width, show_pane_count);
+}
+
+pub fn tabButtonTitleBudgetStyled(
+    style: TabLabelStyle,
+    index: usize,
+    active: bool,
+    pane_count: usize,
+    max_width: usize,
+    show_pane_count: bool,
+) usize {
     // Render the decorations around an empty title so the measurement can
-    // never drift from the format strings below, and measure them with the
+    // never drift from `writeTabButtonLabel`, and measure them with the
     // same `displayWidth` the compaction spends its budget in.
     var buf: [96]u8 = undefined;
-    const decoration = if (show_pane_count and pane_count > 1)
-        std.fmt.bufPrint(
-            &buf,
-            tab_button_label_pane_fmt,
-            .{ tabButtonActiveMarker(active), index + 1, "", pane_count },
-        )
-    else
-        std.fmt.bufPrint(
-            &buf,
-            tab_button_label_fmt,
-            .{ tabButtonActiveMarker(active), index + 1, "" },
-        );
+    var w: std.Io.Writer = .fixed(&buf);
     // `buf` holds the widest decoration two `usize` decimals can produce, so
     // the error arm is unreachable in practice; charging the whole budget
     // keeps it conservative rather than silently restoring the old overflow.
-    const decoration_width = if (decoration) |text| displayWidth(text) else |_| max_width;
+    const decoration_width = if (writeTabButtonLabel(&w, style, index, active, "", pane_count, show_pane_count))
+        displayWidth(w.buffered())
+    else |_|
+        max_width;
     return @max(tab_button_min_title_width, max_width -| decoration_width);
 }
 
@@ -1233,31 +1256,26 @@ pub fn buildTabButtonLabel(
     max_width: usize,
     show_pane_count: bool,
 ) ![]u8 {
-    const budget = tabButtonTitleBudget(index, active, pane_count, max_width, show_pane_count);
+    return buildTabButtonLabelStyled(alloc, .decorated, base_title, index, active, pane_count, max_width, show_pane_count);
+}
+
+pub fn buildTabButtonLabelStyled(
+    alloc: Allocator,
+    style: TabLabelStyle,
+    base_title: ?[]const u8,
+    index: usize,
+    active: bool,
+    pane_count: usize,
+    max_width: usize,
+    show_pane_count: bool,
+) ![]u8 {
+    const budget = tabButtonTitleBudgetStyled(style, index, active, pane_count, max_width, show_pane_count);
     const compact = try compactHostLabel(alloc, base_title orelse "noctty", budget);
     defer alloc.free(compact);
-    if (show_pane_count and pane_count > 1) {
-        return try std.fmt.allocPrint(
-            alloc,
-            tab_button_label_pane_fmt,
-            .{
-                tabButtonActiveMarker(active),
-                index + 1,
-                compact,
-                pane_count,
-            },
-        );
-    }
-
-    return try std.fmt.allocPrint(
-        alloc,
-        tab_button_label_fmt,
-        .{
-            tabButtonActiveMarker(active),
-            index + 1,
-            compact,
-        },
-    );
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeTabButtonLabel(&out.writer, style, index, active, compact, pane_count, show_pane_count);
+    return try out.toOwnedSlice();
 }
 
 fn buildTabOverviewBannerText(
@@ -3336,6 +3354,29 @@ test "win32 buildTabButtonLabel omits pane count for single pane tabs" {
     const title = try buildTabButtonLabel(std.testing.allocator, "pwsh", 0, false, 1, 24, false);
     defer std.testing.allocator.free(title);
     try std.testing.expectEqualStrings("1: pwsh", title);
+}
+
+test "win32 plain tab labels show the title and pane count only" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const active = try buildTabButtonLabelStyled(std.testing.allocator, .plain, "pwsh", 1, true, 3, 24, true);
+    defer std.testing.allocator.free(active);
+    try std.testing.expectEqualStrings("pwsh (3)", active);
+
+    const inactive = try buildTabButtonLabelStyled(std.testing.allocator, .plain, "pwsh", 0, false, 1, 24, false);
+    defer std.testing.allocator.free(inactive);
+    try std.testing.expectEqualStrings("pwsh", inactive);
+}
+
+test "win32 plain tab labels give the whole budget to the title" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    try std.testing.expectEqual(@as(usize, 24), tabButtonTitleBudgetStyled(.plain, 0, true, 1, 24, false));
+    try std.testing.expectEqual(@as(usize, 20), tabButtonTitleBudgetStyled(.plain, 0, true, 3, 24, true));
+
+    const title = try buildTabButtonLabelStyled(std.testing.allocator, .plain, "this-is-a-very-long-terminal-title", 4, true, 1, 24, false);
+    defer std.testing.allocator.free(title);
+    try std.testing.expectEqualStrings("this-is-a-very-long-t...", title);
 }
 
 test "win32 buildTabButtonLabel compacts long titles" {

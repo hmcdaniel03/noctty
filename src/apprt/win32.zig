@@ -13140,7 +13140,10 @@ fn createIconFontForFace(face: [*:0]const u16, height_px: i32) ?*anyopaque {
     var lf: LOGFONTW = .{};
     lf.lfHeight = -height_px;
     lf.lfWeight = c.FW_NORMAL;
-    lf.lfQuality = c.CLEARTYPE_QUALITY;
+    // Grayscale, as Windows draws its own caption glyphs: ClearType's
+    // subpixel fringes turn a one-pixel icon stroke red and green, which
+    // shows on any tinted titlebar.
+    lf.lfQuality = c.ANTIALIASED_QUALITY;
     const name = std.mem.span(face);
     const copy_len = @min(name.len, c.LF_FACESIZE - 1);
     @memcpy(lf.lfFaceName[0..copy_len], name[0..copy_len]);
@@ -16899,7 +16902,8 @@ const Host = struct {
         // whether a label that is built to fit fits. It also answered
         // differently for an active tab than for its inactive neighbour
         // showing the same title.
-        const budget = labels.tabButtonTitleBudget(
+        const budget = labels.tabButtonTitleBudgetStyled(
+            tabLabelStyle(&self.app.config),
             tab.cached_button_index,
             tab.cached_button_active,
             tab.cached_button_pane_count,
@@ -21912,7 +21916,22 @@ const Host = struct {
         if (profile_kind) |kind| {
             colors = applyProfileChromeAccent(colors, kind, theme.is_dark, active, hovered, pressed, disabled);
         }
-        if (tab_button and !disabled) {
+        const ghostty_tabs = tab_button and theme.tab_active_bg != null;
+        if (ghostty_tabs and !disabled) {
+            // Borderless, as macOS draws them: the active tab is the band
+            // itself, so it opens straight into the terminal below, and the
+            // others sit a shade back from it.
+            colors.fg = if (active or hovered) theme.text_primary else theme.button_chrome_fg;
+            colors.bg = if (active)
+                theme.tab_active_bg.?
+            else
+                blendColorRGB(
+                    theme.chrome_bg,
+                    theme.text_primary,
+                    if (hovered) ghostty_hover_tab_shade else ghostty_inactive_tab_shade,
+                );
+            colors.border = colors.bg;
+        } else if (tab_button and !disabled) {
             colors.fg = if (active or hovered) theme.text_primary else theme.button_chrome_fg;
             if (active) {
                 colors.bg = if (theme.is_dark)
@@ -21947,7 +21966,7 @@ const Host = struct {
         // Erase with parent background, then draw rounded button
         const parent_bg = if (overlay) theme.overlay_bg else theme.chrome_bg;
         fillSolidRect(draw.hDC, draw.rcItem, parent_bg);
-        drawRoundedRect(draw.hDC, draw.rcItem, bg, border, self.scaled(4));
+        drawRoundedRect(draw.hDC, draw.rcItem, bg, border, self.scaled(if (ghostty_tabs) 6 else 4));
         if (profile_kind) |kind| {
             const stripe = profileChromeStripeColor(kind, theme.is_dark, active, hovered, pressed, disabled);
             // Inset stripe to fit inside rounded corners
@@ -23462,8 +23481,9 @@ const Host = struct {
                 // made an animated title flicker the popup: `refreshTabTooltip`.
                 if (shown == tab.id) tooltip_title_changed = !title_unchanged;
             }
-            const label = try buildTabButtonLabel(
+            const label = try labels.buildTabButtonLabelStyled(
                 self.app.core_app.alloc,
+                tabLabelStyle(&self.app.config),
                 title,
                 i,
                 active,
@@ -23582,11 +23602,17 @@ const Host = struct {
         // and the active tab's accent border over the terminal (#244). Decide
         // the strip's visibility once and gate every child that belongs to it.
         const tab_strip_visible = self.shouldShowTabBar();
+        // `auto` keeps the band on this runtime (it is the titlebar and
+        // holds [+] / [▾]), but Ghostty-style chrome leaves a lone tab out
+        // of it, so one tab reads as one window, the way Ghostty shows it.
+        const lone_tab_hidden = self.app.config.@"window-show-tab-bar" == .auto and
+            self.tabs.items.len == 1 and
+            tabLabelStyle(&self.app.config) == .plain;
         var active_tab_left: ?i32 = null;
         for (self.tabs.items, 0..) |*tab, i| {
             if (tab.button_hwnd) |button_hwnd| {
                 if (tabStripChildVisible(
-                    tab_strip_visible,
+                    tab_strip_visible and !lone_tab_hidden,
                     i >= tab_range.start and i < tab_range.start + tab_range.count,
                 )) {
                     const visible_index: i32 = @intCast(i - tab_range.start);
@@ -23630,7 +23656,7 @@ const Host = struct {
         // rather than on a degenerate box at the window origin.
         if (self.tab_container_hwnd) |container_hwnd| {
             const visible_tabs: i32 = @intCast(tab_range.count);
-            if (tabStripChildVisible(tab_strip_visible, visible_tabs > 0)) {
+            if (tabStripChildVisible(tab_strip_visible and !lone_tab_hidden, visible_tabs > 0)) {
                 changed.* = applyChromeChildRect(
                     container_hwnd,
                     &self.tab_container_placement,
@@ -24330,8 +24356,9 @@ const Host = struct {
             // paint themselves above this region via WM_DRAWITEM and do
             // not occlude it. Inset 3 px on each horizontal edge to
             // match Windows Terminal's tab indicator treatment
-            // (wt-chrome-reference.md §1).
-            {
+            // (wt-chrome-reference.md §1). Ghostty-style tabs mark the
+            // active tab by its fill instead, so they draw no underline.
+            if (titlebar_theme.tab_active_bg == null) {
                 const now_ms = sys.GetTickCount64();
                 const cur = self.tab_underline.currentRect(now_ms);
                 const underline_left = @as(i32, @intFromFloat(@round(cur.left))) + self.scaled(3);
@@ -24400,8 +24427,10 @@ const Host = struct {
             // The separator belongs on the band boundary the terminal
             // actually starts at, so it tracks `contentBands` rather than the
             // tab metric alone.
+            // Ghostty-style chrome has none: the band and the terminal are
+            // meant to read as one surface.
             const separator_bottom = @max(tab_h, band_bottom);
-            fillSolidRect(
+            if (titlebar_theme.tab_active_bg == null) fillSolidRect(
                 hdc,
                 .{
                     .left = 0,
@@ -26597,7 +26626,20 @@ fn resolveTheme(config: *const configpkg.Config) ThemeColors {
         .light => lightTheme(),
         .system => if (isSystemDarkMode()) darkTheme() else lightTheme(),
         .auto => if (isSystemDarkMode()) darkTheme() else lightTheme(),
-        .ghostty => darkTheme(),
+        // Menus, the palette and Settings take the polarity of the colors
+        // the titlebar band is painted with, so a light terminal gets light
+        // chrome rather than a dark shell around it.
+        .ghostty => ghostty: {
+            var base = if (titlebarBandIsDark(rgbFromColorRef(ghosttyTitlebarBackground(config))))
+                darkTheme()
+            else
+                lightTheme();
+            // Splits are told apart by `unfocused-split-opacity` dimming,
+            // as in Ghostty, so the focused pane gets no accent frame.
+            base.pane_divider = ghosttyDividerColor(config);
+            base.pane_divider_focused = base.pane_divider;
+            break :ghostty base;
+        },
     };
     const follow = config.@"accent-follow-system";
     return withSystemTabAccent(theme, follow, if (follow) resolveSystemAccentColor() else null);
@@ -26691,21 +26733,55 @@ fn configuredHostWindowPosition(config: *const configpkg.Config) ?struct { x: i3
     };
 }
 
-fn titlebarCaptionColor(theme: *const ThemeColors, config: *const configpkg.Config) u32 {
-    if (config.@"window-theme" == .ghostty) {
-        if (config.@"window-titlebar-background") |color| {
-            return rgb(color.r, color.g, color.b);
-        }
-    }
+/// How far `window-theme = ghostty` shades an inactive tab from the band
+/// toward the text, and how much further a hovered one goes. The active tab
+/// is the band itself, as on macOS, so these are what set it apart.
+const ghostty_inactive_tab_shade: f32 = 0.07;
+const ghostty_hover_tab_shade: f32 = 0.11;
 
+/// How far a split divider sits from the terminal background toward the
+/// foreground under `window-theme = ghostty`: a hairline in the theme's own
+/// hue rather than a Windows gray.
+const ghostty_divider_shade: f32 = 0.16;
+
+/// The titlebar band under `window-theme = ghostty`: the configured
+/// `window-titlebar-background`, or, as Ghostty does on macOS, the terminal's
+/// own background, so the band and the terminal read as one surface.
+fn ghosttyTitlebarBackground(config: *const configpkg.Config) u32 {
+    if (config.@"window-titlebar-background") |color| return rgb(color.r, color.g, color.b);
+    const bg = config.background;
+    return rgb(bg.r, bg.g, bg.b);
+}
+
+/// The split divider under `window-theme = ghostty`: `split-divider-color`,
+/// else the terminal background faded toward its foreground.
+fn ghosttyDividerColor(config: *const configpkg.Config) u32 {
+    if (config.@"split-divider-color") |color| return rgb(color.r, color.g, color.b);
+    const bg = config.background;
+    const fg = config.foreground;
+    return blendColorRGB(rgb(bg.r, bg.g, bg.b), rgb(fg.r, fg.g, fg.b), ghostty_divider_shade);
+}
+
+/// The titlebar text under `window-theme = ghostty`: the configured
+/// `window-titlebar-foreground`, else the terminal foreground when the band
+/// is derived from the terminal too. A band given an explicit background
+/// keeps the palette text `clientTitlebarTheme` picks for its polarity, so a
+/// custom band never inherits a foreground that was chosen for another color.
+fn ghosttyTitlebarForeground(config: *const configpkg.Config) ?u32 {
+    if (config.@"window-titlebar-foreground") |color| return rgb(color.r, color.g, color.b);
+    if (config.@"window-titlebar-background" != null) return null;
+    const fg = config.foreground;
+    return rgb(fg.r, fg.g, fg.b);
+}
+
+fn titlebarCaptionColor(theme: *const ThemeColors, config: *const configpkg.Config) u32 {
+    if (config.@"window-theme" == .ghostty) return ghosttyTitlebarBackground(config);
     return theme.chrome_bg;
 }
 
 fn titlebarTextColor(theme: *const ThemeColors, config: *const configpkg.Config) u32 {
     if (config.@"window-theme" == .ghostty) {
-        if (config.@"window-titlebar-foreground") |color| {
-            return rgb(color.r, color.g, color.b);
-        }
+        if (ghosttyTitlebarForeground(config)) |color| return color;
     }
 
     return theme.text_primary;
@@ -26745,8 +26821,9 @@ fn clientTitlebarTheme(
     var result = theme.*;
     if (!integrated or high_contrast or config.@"window-theme" != .ghostty) return result;
 
-    if (config.@"window-titlebar-background") |background| {
+    {
         result.chrome_bg = titlebarCaptionColor(theme, config);
+        const background = rgbFromColorRef(result.chrome_bg);
 
         // The band's polarity is whatever the configured background says it
         // is, not whatever the base theme was. Every polarity-dependent token
@@ -26782,10 +26859,26 @@ fn clientTitlebarTheme(
         }
     }
     if (config.@"window-titlebar-foreground" != null) {
+        // An explicit foreground is taken as given, for every glyph.
         const foreground = titlebarTextColor(theme, config);
         result.text_primary = foreground;
         result.button_chrome_fg = foreground;
+    } else if (ghosttyTitlebarForeground(config)) |foreground| {
+        // Derived from the terminal: inactive tab titles and the caption
+        // glyphs sit back from the active title, as Ghostty's do, and any
+        // border on the band is the same text faded further, so every line
+        // on it is one hue.
+        result.text_primary = foreground;
+        result.button_chrome_fg = blendColorRGB(foreground, result.chrome_bg, 0.3);
+        result.text_secondary = result.button_chrome_fg;
+        result.chrome_border = blendColorRGB(result.chrome_bg, foreground, 0.16);
     }
+
+    // Ghostty-style tabs: the active one is filled with the terminal
+    // background, so it reads as the top of the pane it shows. Unless the
+    // band was given its own color, that is the band itself.
+    const term_bg = config.background;
+    result.tab_active_bg = rgb(term_bg.r, term_bg.g, term_bg.b);
     return result;
 }
 
@@ -30625,6 +30718,14 @@ const shouldShowPaneCount = labels.shouldShowPaneCount;
 const visibleTabRange = labels.visibleTabRange;
 
 const buildTabButtonLabel = labels.buildTabButtonLabel;
+
+/// `window-theme = ghostty` draws tabs the way Ghostty does: the title alone,
+/// with the active tab told apart by its fill. High Contrast suppresses that
+/// fill, so it keeps the `* N:` marker as its non-color cue.
+fn tabLabelStyle(config: *const configpkg.Config) labels.TabLabelStyle {
+    if (config.@"window-theme" == .ghostty and !isHighContrastActive()) return .plain;
+    return .decorated;
+}
 
 const buildSearchOverlayLabel = labels.buildSearchOverlayLabel;
 
@@ -45134,9 +45235,17 @@ test "win32 titlebar colors honor ghostty overrides" {
     try std.testing.expectEqual(theme.text_primary, titlebarTextColor(&theme, &config));
 
     config.@"window-theme" = .ghostty;
-    // Nothing configured: the client band must be byte-identical to the
-    // base theme, or every integrated titlebar changes appearance.
-    try std.testing.expectEqualDeep(theme, clientTitlebarTheme(&theme, &config, true, false));
+    // Nothing configured: the band is the terminal itself, as on macOS, with
+    // the terminal's text, and the active tab filled to match.
+    const term_bg = rgb(config.background.r, config.background.g, config.background.b);
+    const term_fg = rgb(config.foreground.r, config.foreground.g, config.foreground.b);
+    const derived = clientTitlebarTheme(&theme, &config, true, false);
+    try std.testing.expectEqual(term_bg, derived.chrome_bg);
+    try std.testing.expectEqual(term_bg, titlebarCaptionColor(&theme, &config));
+    try std.testing.expectEqual(term_fg, derived.text_primary);
+    try std.testing.expectEqual(term_fg, titlebarTextColor(&theme, &config));
+    try std.testing.expectEqual(@as(?u32, term_bg), derived.tab_active_bg);
+    try std.testing.expect(derived.button_chrome_fg != term_fg);
 
     // Background only: derive readable glyphs from its luminance instead of
     // keeping the dark palette's light text on a light band.
@@ -45161,12 +45270,13 @@ test "win32 titlebar colors honor ghostty overrides" {
     // through `is_dark`, so it must survive the override untouched.
     try std.testing.expectEqual(theme.accent, background_only.accent);
 
-    // Foreground only: keep the theme background and its darkness.
+    // Foreground only: the band stays the terminal background, with its
+    // darkness, and the explicit foreground is used as given.
     config.@"window-titlebar-background" = null;
     config.@"window-titlebar-foreground" = .{ .r = 4, .g = 5, .b = 6 };
     const foreground_only = clientTitlebarTheme(&theme, &config, true, false);
-    try std.testing.expectEqual(theme.chrome_bg, foreground_only.chrome_bg);
-    try std.testing.expectEqual(theme.is_dark, foreground_only.is_dark);
+    try std.testing.expectEqual(term_bg, foreground_only.chrome_bg);
+    try std.testing.expect(foreground_only.is_dark);
     try std.testing.expectEqual(rgb(4, 5, 6), foreground_only.text_primary);
     try std.testing.expectEqual(rgb(4, 5, 6), foreground_only.button_chrome_fg);
 
