@@ -8,6 +8,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const paste_protection = @import("win32_paste_protection.zig");
 
+/// A new optional field is not a new version: older builds skip it. Anything an
+/// older build would misread or reject (a new enum value, a new node kind, a
+/// changed meaning) is, and bumps this.
 pub const current_schema_version: u32 = 1;
 pub const max_scrollback_lines: usize = 10_000;
 pub const max_scrollback_line_bytes: usize = 16 * 1024;
@@ -42,8 +45,8 @@ const VersionHeader = struct {
 
 /// Named layouts share the session schema but treat window placement as
 /// opaque input. Decode those fields as arbitrary JSON so stale state names
-/// or mistyped geometry cannot reject an otherwise valid layout shape, while
-/// keeping every non-placement field strict.
+/// or mistyped geometry cannot reject an otherwise valid layout shape; every
+/// other field keeps its type and validation.
 const LayoutState = struct {
     schema_version: u32 = current_schema_version,
     windows: []const LayoutWindow = &.{},
@@ -164,14 +167,18 @@ fn parseAllocMode(
     });
     defer header.deinit();
 
+    if (header.value.schema_version > current_schema_version) return error.NewerSchema;
     if (header.value.schema_version != current_schema_version) {
         return error.UnsupportedVersion;
     }
 
+    // Unknown fields are skipped: a field added within this version is
+    // additive by definition, and a build that does not know it must still
+    // read the rest. Only an incompatible change bumps the version.
     if (strip_placement) {
         var layout = try std.json.parseFromSlice(LayoutState, alloc, raw, .{
             .allocate = .alloc_always,
-            .ignore_unknown_fields = false,
+            .ignore_unknown_fields = true,
         });
         errdefer layout.deinit();
 
@@ -196,7 +203,7 @@ fn parseAllocMode(
 
     var parsed = try std.json.parseFromSlice(SessionState, alloc, raw, .{
         .allocate = .alloc_always,
-        .ignore_unknown_fields = false,
+        .ignore_unknown_fields = true,
     });
     errdefer parsed.deinit();
 
@@ -771,25 +778,35 @@ test "win32 named layout parsing strips placement before validation" {
     }
 }
 
-test "win32 named layout parsing stays strict outside placement" {
+test "win32 named layout parsing skips fields it does not know" {
     const raw =
-        \\{"schema_version":1,"windows":[{"future_placement":true,"selected_tab":0,"tabs":[{"selected_leaf":0,"layout":{"root":0,"nodes":[{"pane":{}}]}}]}]}
+        \\{"schema_version":1,"windows":[{"future_placement":true,"selected_tab":0,"tabs":[{"selected_leaf":0,"layout":{"root":0,"nodes":[{"pane":{"future_pane_field":1}}]}}]}]}
     ;
 
-    try std.testing.expectError(
-        error.UnknownField,
-        parseLayoutAlloc(std.testing.allocator, raw),
-    );
+    var parsed = try parseLayoutAlloc(std.testing.allocator, raw);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.windows.len);
+    try std.testing.expect(parsed.value.windows[0].x == null);
 }
 
-test "win32 session state parse rejects unsupported schema version" {
-    const raw =
-        \\{"schema_version":9,"windows":[]}
-    ;
-
+test "win32 session state parse separates newer from unsupported schema versions" {
+    try std.testing.expectError(
+        error.NewerSchema,
+        parseAlloc(std.testing.allocator,
+            \\{"schema_version":9,"windows":[]}
+        ),
+    );
+    try std.testing.expectError(
+        error.NewerSchema,
+        parseLayoutAlloc(std.testing.allocator,
+            \\{"schema_version":2,"windows":[]}
+        ),
+    );
     try std.testing.expectError(
         error.UnsupportedVersion,
-        parseAlloc(std.testing.allocator, raw),
+        parseAlloc(std.testing.allocator,
+            \\{"schema_version":0,"windows":[]}
+        ),
     );
 }
 
@@ -843,14 +860,31 @@ test "win32 session state parse rejects newer schema before unknown field errors
     ;
 
     try std.testing.expectError(
-        error.UnsupportedVersion,
+        error.NewerSchema,
         parseAlloc(std.testing.allocator, raw),
     );
 }
 
-test "win32 session state parse keeps current schema strict about unknown fields" {
+test "win32 session state parse skips unknown fields within the current schema" {
+    // A field a later build adds without a version bump, at every level a
+    // document nests: an older build still restores the rest.
     const raw =
-        \\{"schema_version":1,"windows":[],"future":{"layout_generation":1}}
+        \\{"schema_version":1,"future":{"a":[1,2]},"windows":[{"x":10,"y":20,"width":1280,"height":720,"state":"normal","monitor":"\\\\.\\DISPLAY2","selected_tab":0,"tabs":[{"selected_leaf":0,"pinned":true,"layout":{"root":0,"nodes":[{"split":{"axis":"horizontal","ratio":0.5,"first":1,"second":2,"gap":4}},{"pane":{"cwd":"C:\\src\\noctty","env":{"A":"b"},"scrollback":{"captured_at_unix_ms":1,"lines":["x"],"wrapped":true}}},{"pane":{"profile":"pwsh"}}]}}]}]}
+    ;
+
+    var parsed = try parseAlloc(std.testing.allocator, raw);
+    defer parsed.deinit();
+    const window = parsed.value.windows[0];
+    try std.testing.expectEqual(@as(?i32, 1280), window.width);
+    try std.testing.expectEqual(@as(usize, 3), window.tabs[0].layout.nodes.len);
+    try std.testing.expectEqualStrings("C:\\src\\noctty", window.tabs[0].layout.nodes[1].pane.cwd.?);
+    try std.testing.expectEqualStrings("x", window.tabs[0].layout.nodes[1].pane.scrollback.?.lines[0]);
+}
+
+test "win32 session state parse still rejects a node kind it does not know" {
+    // A new kind of node is an incompatible change, not an additive field.
+    const raw =
+        \\{"schema_version":1,"windows":[{"selected_tab":0,"tabs":[{"selected_leaf":0,"layout":{"root":0,"nodes":[{"browser":{"url":"x"}}]}}]}]}
     ;
 
     try std.testing.expectError(
